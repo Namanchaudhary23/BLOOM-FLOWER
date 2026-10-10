@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Midnight Bloom Garden</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Dancing+Script:wght@600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#030509;touch-action:none}
+canvas{display:block;width:100vw;height:100vh}
+#fs{position:fixed;top:12px;right:12px;z-index:10;padding:8px 14px;border:1px solid rgba(255,255,255,.25);
+border-radius:8px;background:rgba(10,14,12,.55);color:#e6ece3;font:13px system-ui,sans-serif;cursor:pointer;
+backdrop-filter:blur(4px);opacity:.75;transition:opacity .2s}
+#fs:hover{opacity:1}
+
+/* ---- cursive title, revealed word by word ---- */
+#title{position:fixed;left:0;right:0;top:6%;z-index:5;pointer-events:none;
+padding:0 16px;margin:0;font-weight:600;letter-spacing:.02em;
+font-family:'Dancing Script','Brush Script MT','Segoe Script',cursive;
+font-size:clamp(1.6rem,min(4.6vw,7vh),3rem);line-height:1.3;color:#ffe6ee;text-align:center;
+text-shadow:0 0 8px rgba(243,154,176,.9),0 0 22px rgba(233,130,155,.65),0 0 46px rgba(247,182,199,.4)}
+#title .w{display:inline-block;opacity:0;transform:translateY(24px) scale(.92);filter:blur(10px);
+animation:wordIn 1.4s cubic-bezier(.22,.8,.25,1) forwards, glow 3.5s ease-in-out infinite alternate}
+#title .line{display:block}
+#title .w1{animation-delay:1.2s,2.6s}
+#title .w2{animation-delay:2.8s,4.2s}
+#title .w3{animation-delay:4.4s,5.8s}
+@keyframes wordIn{to{opacity:1;transform:none;filter:blur(0)}}
+@keyframes glow{from{text-shadow:0 0 8px rgba(243,154,176,.9),0 0 22px rgba(233,130,155,.65),0 0 46px rgba(247,182,199,.4)}
+to{text-shadow:0 0 12px rgba(255,200,215,1),0 0 30px rgba(243,154,176,.8),0 0 64px rgba(247,182,199,.55)}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="fs" type="button">⛶ Fullscreen</button>
+<h1 id="title">
+  <span class="line"><span class="w w1">FOR</span></span>
+  <span class="line"><span class="w w2">MY</span> <span class="w w3">BESTTUU</span></span>
+</h1>
+
+<script>
+/* ===================== SETUP ===================== */
+const canvas = document.getElementById('c');
+// alpha:false -> opaque canvas, browser skips blending with the page (faster)
+const ctx = canvas.getContext('2d', { alpha: false });
+
+let W = 0, H = 0, DPR = 1;
+let flowers = [], split = 0;      // flowers sorted by size; [0,split) = distant ones
+let grassBuckets = [[], [], []];  // grass grouped by line width (for batching)
+let twinkle = [];
+let bg = null;                    // pre-rendered background
+let lastTime = 0;
+
+const TAU = Math.PI * 2;
+const palette = ['#f39ab0','#e9829b','#ffd34c','#fff0d5','#f7b6c7','#f3a6a9','#f7c9a4'];
+const GRASS_WIDTHS = [1.2, 2, 2.6];
+const MAX_FLOWERS = 700;
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// One reusable leaf shape (unit size) -> scaled with a transform matrix
+const LEAF = new Path2D();
+LEAF.moveTo(0, 0);
+LEAF.bezierCurveTo(.35, -.75, 1, -.55, 1, 0);
+LEAF.bezierCurveTo(.62, .3, .2, .25, 0, 0);
+
+/* ===================== COLOR HELPER ===================== */
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const target = amt < 0 ? 0 : 255, p = Math.abs(amt);
+  r = Math.round(r + (target - r) * p);
+  g = Math.round(g + (target - g) * p);
+  b = Math.round(b + (target - b) * p);
+  return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+}
+
+/* ===================== FLOWER HEAD SPRITE (drawn ONCE) ===================== */
+function petalShape(g, x, y, rx, ry, rot, color) {
+  g.save(); g.translate(x, y); g.rotate(rot); g.fillStyle = color;
+  g.beginPath(); g.moveTo(0, 0);
+  g.bezierCurveTo(-rx * .9, -ry * .2, -rx * .7, -ry, 0, -ry);
+  g.bezierCurveTo(rx * .8, -ry, rx * .95, -ry * .18, 0, 0); g.fill();
+  g.globalAlpha = .22; g.fillStyle = '#fff5e8';
+  g.beginPath(); g.ellipse(-rx * .12, -ry * .55, rx * .17, ry * .26, -.25, 0, TAU); g.fill();
+  g.restore();
+}
+
+function paintHead(g, f) {
+  const s = f.size, petals = f.petals;
+  g.shadowColor = f.color;
+  g.shadowBlur = (f.distant ? 2 : 7) * DPR;   // expensive, but only done once per sprite
+
+  if (f.kind === 'rose') {
+    for (let layer = 3; layer >= 0; layer--) {
+      const n = layer === 0 ? 5 : layer === 1 ? 7 : layer === 2 ? 9 : 11;
+      const rr = s * (.2 + layer * .17), pr = s * (.32 + layer * .08);
+      for (let i = 0; i < n; i++) {
+        const a = i * TAU / n + layer * .42;
+        petalShape(g, Math.cos(a) * rr, Math.sin(a) * rr, pr, s * (.48 + layer * .07),
+          a + Math.PI / 2, layer % 2 ? f.color : shade(f.color, layer * .045));
+      }
+    }
+    g.shadowBlur = 0; g.fillStyle = shade(f.color, -.12);
+    g.beginPath(); g.arc(0, 0, s * .22, 0, TAU); g.fill();
+
+  } else if (f.kind === 'sunflower') {
+    for (let i = 0; i < petals; i++) {
+      const a = i * TAU / petals;
+      petalShape(g, Math.cos(a) * s * .48, Math.sin(a) * s * .48, s * .32, s * .7, a + Math.PI / 2, '#f8c52e');
+    }
+    g.shadowBlur = DPR; g.fillStyle = '#49301d';
+    g.beginPath(); g.arc(0, 0, s * .4, 0, TAU); g.fill();
+    for (let i = 0; i < 24; i++) {           // deterministic seeds (no random per frame)
+      const a = i * 2.4, r = s * (.08 + ((i * 37) % 24) / 24 * .24);
+      g.fillStyle = i % 2 ? '#c38a36' : '#e7b650';
+      g.beginPath(); g.arc(Math.cos(a) * r, Math.sin(a) * r, .6, 0, 7); g.fill();
+    }
+
+  } else { // daisy
+    for (let i = 0; i < petals; i++) {
+      const a = i * TAU / petals;
+      petalShape(g, Math.cos(a) * s * .35, Math.sin(a) * s * .35, s * .36, s * .75, a + Math.PI / 2, f.color);
+    }
+    g.shadowBlur = 2 * DPR; g.fillStyle = '#d9b66b';
+    g.beginPath(); g.arc(0, 0, s * .26, 0, TAU); g.fill();
+    g.fillStyle = '#765039';
+    g.beginPath(); g.arc(0, 0, s * .16, 0, TAU); g.fill();
+  }
+}
+
+function buildSprite(f) {
+  const dim = Math.ceil((f.size * 1.45 + 10) * 2);  // CSS px
+  const c = document.createElement('canvas');
+  c.width = c.height = dim * DPR;
+  const g = c.getContext('2d');
+  g.scale(DPR, DPR);
+  g.translate(dim / 2, dim / 2);
+  paintHead(g, f);
+  f.sprite = c; f.dim = dim; f.half = dim / 2;
+}
+
+/* ===================== FLOWER FACTORY ===================== */
+function makeFlower(x, depth = Math.random(), opt = {}) {
+  const distant = opt.near ? false : depth < .43;
+  const r1 = Math.random(), r2 = Math.random();
+  const f = {
+    x, yBase: H * rand(.91, 1.015), distant,
+    stem: distant ? rand(H * .24, H * .43) : rand(H * .12, H * .38),
+    sway: rand(2, 13), phase: rand(0, 7),
+    petals: Math.floor(rand(8, 14)),
+    size: opt.near ? rand(8, 14) : (distant ? rand(2, 4) : rand(6, 13)),
+    color: palette[Math.floor(rand(0, palette.length))],
+    kind: r1 < .25 ? 'sunflower' : (r2 < .45 ? 'rose' : 'daisy'),
+    delay: opt.delay !== undefined ? opt.delay : rand(0, 1800),
+    p: 0, pr: 0, tx: 0, ty: 0, sw: 0, leaves: []
+  };
+  // keep every flower below the title area so text never overlaps blooms
+  f.stem = Math.max(H * .05, Math.min(f.stem, f.yBase - H * .38));
+  // leaf params are fixed (no rand() inside the render loop -> no jitter, no cost)
+  const n = Math.floor(rand(2, 5));
+  for (let i = 0; i < n; i++) {
+    f.leaves.push({
+      q: .24 + i * .14,
+      size: distant ? 4 : rand(8, 14),
+      side: i % 2 ? 1 : -1,
+      color: i % 2 ? '#367449' : '#285d3a'
+    });
+  }
+  buildSprite(f);
+  return f;
+}
+
+function sortFlowers() {
+  flowers.sort((a, b) => a.size - b.size);
+  split = flowers.findIndex(f => !f.distant);
+  if (split < 0) split = flowers.length;
+}
+
+/* ===================== BACKGROUND (baked ONCE per resize) ===================== */
+function bakeBackground() {
+  bg = document.createElement('canvas');
+  bg.width = W * DPR; bg.height = H * DPR;
+  const g = bg.getContext('2d');
+  g.scale(DPR, DPR);
+
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#03040a'); grad.addColorStop(.56, '#060910'); grad.addColorStop(1, '#101b13');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+
+  g.fillStyle = '#fff4dc';
+  const count = Math.floor(W * H / 5000);
+  for (let i = 0; i < count; i++) {
+    g.globalAlpha = rand(.08, .48);
+    g.beginPath(); g.arc(rand(0, W), rand(0, H * .72), rand(.3, 1.1), 0, TAU); g.fill();
+  }
+  g.globalAlpha = 1;
+
+  const glow = g.createRadialGradient(W * .5, H * .86, 0, W * .5, H * .86, W * .7);
+  glow.addColorStop(0, 'rgba(43,96,48,.2)'); glow.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = glow; g.fillRect(0, H * .25, W, H * .75);
+
+  // only a few stars twinkle live (cheap)
+  twinkle = Array.from({ length: 40 }, () => ({
+    x: rand(0, W), y: rand(0, H * .7), s: rand(1, 2), a: rand(.25, .6), ph: rand(0, 7)
+  }));
+}
+
+/* ===================== RESIZE ===================== */
+function resize() {
+  const oldW = W, oldH = H;
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+
+  bakeBackground();
+
+  // grass, grouped into 3 width buckets so each bucket = ONE stroke() call
+  grassBuckets = [[], [], []];
+  const gc = Math.floor(W / 4);
+  for (let i = 0; i < gc; i++) {
+    grassBuckets[i % 3].push({
+      x: rand(0, W), h: rand(H * .04, H * .18), lean: rand(-18, 18), ph: rand(0, 7)
+    });
+  }
+
+  if (!flowers.length) {
+    const count = Math.min(Math.floor(W / 6), 320);
+    for (let i = 0; i < count; i++) flowers.push(makeFlower(rand(-10, W + 10), Math.random()));
+    sortFlowers();
+  } else if (oldW) {
+    const sx = W / oldW, sy = H / oldH;
+    flowers.forEach(f => { f.x *= sx; f.yBase *= sy; f.stem *= sy; });
+  }
+}
+
+/* ===================== RENDER ===================== */
+function drawGroup(from, to, alpha, stemColor, stemWidth, t) {
+  if (from >= to) return;
+  ctx.globalAlpha = alpha;
+
+  // 1) all stems of the group in ONE path / ONE stroke
+  ctx.strokeStyle = stemColor; ctx.lineWidth = stemWidth; ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (let i = from; i < to; i++) {
+    const f = flowers[i];
+    if (f.p <= 0) continue;
+    ctx.moveTo(f.x, f.yBase);
+    ctx.quadraticCurveTo(f.x + f.sw * .25, f.yBase - f.stem * .55 * f.p, f.tx, f.ty);
+  }
+  ctx.stroke();
+
+  // 2) leaves (setTransform instead of save/translate/rotate/restore)
+  for (let i = from; i < to; i++) {
+    const f = flowers[i];
+    if (f.p <= 0) continue;
+    const wob = Math.sin(t * .001 + f.phase) * .12;
+    for (let j = 0; j < f.leaves.length; j++) {
+      const L = f.leaves[j];
+      const lx = f.x + f.sw * L.q, ly = f.yBase - f.stem * L.q * f.p;
+      const a = L.side * (.5 + wob);
+      const k = L.size * DPR, c = Math.cos(a) * k, s = Math.sin(a) * k;
+      ctx.setTransform(c, s, -s, c, lx * DPR, ly * DPR);
+      ctx.fillStyle = L.color;
+      ctx.fill(LEAF);
+    }
+  }
+
+  // 3) heads = a single drawImage of the cached sprite
+  for (let i = from; i < to; i++) {
+    const f = flowers[i];
+    if (f.pr <= .7) continue;
+    const grow = Math.min(1, (f.pr - .7) / .3);                 // smooth bloom-in
+    const sc = grow * grow * (3 - 2 * grow) * (1 + Math.sin(t * .0015 + f.phase) * .025) * DPR;
+    ctx.setTransform(sc, 0, 0, sc, f.tx * DPR, f.ty * DPR);
+    ctx.drawImage(f.sprite, -f.half, -f.half, f.dim, f.dim);
+  }
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalAlpha = 1;
+}
+
+function frame(t) {
+  lastTime = t;
+
+  // background = 1 drawImage (no gradients created per frame)
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(bg, 0, 0);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  // twinkling stars
+  ctx.fillStyle = '#fff4dc';
+  for (let i = 0; i < twinkle.length; i++) {
+    const s = twinkle[i];
+    ctx.globalAlpha = s.a * (.5 + .5 * Math.sin(t * .0015 + s.ph));
+    ctx.fillRect(s.x, s.y, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+
+  // update flower positions once per frame
+  for (let i = 0; i < flowers.length; i++) {
+    const f = flowers[i];
+    const p = Math.min(1, Math.max(0, (t - f.delay) / 1200));
+    f.pr = p;
+    f.p = 1 - Math.pow(1 - p, 3);                               // ease-out growth
+    f.sw = Math.sin(t * .0026 + f.phase) * f.sway * 1.25;
+    f.tx = f.x + f.sw;
+    f.ty = f.yBase - f.stem * f.p;
+  }
+
+  // flowers already sorted (no per-frame sort/copy) -> distant first, then near
+  drawGroup(0, split, .65, '#254b35', 1, t);
+  drawGroup(split, flowers.length, 1, '#39794a', 1.5, t);
+
+  // grass: 3 batched strokes instead of ~600
+  ctx.lineCap = 'round'; ctx.strokeStyle = '#28583a';
+  for (let b = 0; b < 3; b++) {
+    ctx.lineWidth = GRASS_WIDTHS[b];
+    ctx.beginPath();
+    const arr = grassBuckets[b];
+    for (let i = 0; i < arr.length; i++) {
+      const g = arr[i];
+      const lean = g.lean + Math.sin(t * .0032 + g.ph) * 8;
+      ctx.moveTo(g.x, H + 3);
+      ctx.quadraticCurveTo(g.x + lean * .3, H - g.h * .55, g.x + lean, H - g.h);
+    }
+    ctx.stroke();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+/* ===================== INPUT ===================== */
+canvas.addEventListener('pointerdown', e => {
+  if (flowers.length >= MAX_FLOWERS) return;
+  flowers.push(makeFlower(e.clientX, 1, { near: true, delay: lastTime }));
+  sortFlowers();
+});
+
+function toggleFullscreen() {
+  if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+    document.documentElement.requestFullscreen().catch(() => {});
+  } else if (document.exitFullscreen) {
+    document.exitFullscreen().catch(() => {});
+  }
+}
+canvas.addEventListener('dblclick', toggleFullscreen);
+const fsBtn = document.getElementById('fs');
+fsBtn.addEventListener('click', toggleFullscreen);
+document.addEventListener('fullscreenchange', () => {
+  fsBtn.textContent = document.fullscreenElement ? '✕ Exit fullscreen' : '⛶ Fullscreen';
+});
+window.addEventListener('keydown', e => { if (e.key.toLowerCase() === 'f') toggleFullscreen(); });
+
+let resizeTimer;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(resize, 120); });
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
